@@ -1,0 +1,17 @@
+{
+  "name": "kana-swap-api-example",
+  "version": "1.0.0",
+  "description": "TypeScript example using KanaLabs Swap API.",
+  "main": "index.js",
+  "license": "ISC",
+  "dependencies": {
+    "@aptos-labs/ts-sdk": "^1.36.0",
+    "axios": "^1.8.4",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.2"
+  }
+}
