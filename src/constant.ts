@@ -6,9 +6,7 @@ export enum NetworkId {
     'sui' = 5,
     'ethereum' = 6,
     'base' = 7,
-    'klaytn' = 8,
     'zkSync' = 9,
     'Avalanche' = 10,
     'Arbitrum' = 11,
-    'optimistic' = 12
 }
