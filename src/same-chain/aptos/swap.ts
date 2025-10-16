@@ -32,7 +32,7 @@ export const kanaswap = async () => {
             chain: NetworkId.aptos, //Aptos 
             amountIn: AMOUNT_IN,// amonut * token decimal eg: 2*100000000
             slippage: SLIPPAGE_PERCENTAGE, //0.5%
-            sender:  sender.publicKey.toString() //sender address 
+            sender:  sender.accountAddress.toString() //sender address 
 
         },
         headers: {
