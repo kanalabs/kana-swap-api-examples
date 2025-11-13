@@ -1,6 +1,6 @@
 import axios from "axios";
 import "dotenv/config";
-import { NetworkId } from "../../constant";
+import { KANA_API_URL, NetworkId } from "../../../constant";
 import { BigNumber, ethers } from "ethers";
 
 //Constants
@@ -86,7 +86,7 @@ const executeEVMInstruction = async (signer: any, instruction: swapIX) => {
   }
 };
 export const kanaswap = async () => {
-  const response = await axios.get("https://ag-test.kanalabs.io/v1/swapQuote", {
+  const response = await axios.get(`${KANA_API_URL}/v1/swapQuote`, {
     params: {
       inputToken: FROM_TOKEN_ADDRESS, //MATIC
       outputToken: TO_TOKEN_ADDRESS, //USDC
@@ -108,7 +108,7 @@ export const kanaswap = async () => {
 
   try {
     const response = await axios.post(
-      "https://ag-test.kanalabs.io/v1/swapInstruction",
+      `${KANA_API_URL}/v1/swapInstruction`,
       data
     );
     const swapInstruction = await executeEVMInstruction(
