@@ -10,15 +10,18 @@
     "example:evm-swap": "tsx src/same-chain/evm/swap.ts",
     "example:evm-recipient-swap": "tsx src/same-chain/evm/recipientSwap.ts",
     "example:solana-swap": "tsx src/same-chain/solana/swap.ts",
-    "example:solana-recipient-swap": "tsx src/same-chain/solana/recipientSwap.ts"
+    "example:solana-recipient-swap": "tsx src/same-chain/solana/recipientSwap.ts",
+    "example:evm-swap-viem": "tsx src/same-chain/evm/viem/swap.ts",
+    "example:evm-recipient-swap-viem": "tsx src/same-chain/evm/viem/recipientSwap.ts"
   },
   "dependencies": {
-    "@aptos-labs/ts-sdk": "^1.36.0",
-    "@solana/web3.js": "^1.98.2",
-    "axios": "^1.8.4",
-    "bs58": "^6.0.0",
-    "dotenv": "^16.4.7",
-    "ethers": "^5.7.2"
+    "@aptos-labs/ts-sdk": "5.1.1",
+    "@solana/web3.js": "1.98.4",
+    "axios": "1.8.4",
+    "bs58": "6.0.0",
+    "dotenv": "16.4.7",
+    "ethers": "5.7.2",
+    "viem": "2.38.6"
   },
   "devDependencies": {
     "@types/node": "^22.13.11",

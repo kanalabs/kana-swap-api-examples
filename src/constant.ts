@@ -1,3 +1,4 @@
+export const KANA_API_URL = 'https://ag.kanalabs.io';
 export enum NetworkId {
     'solana' = 1,
     'aptos' = 2,

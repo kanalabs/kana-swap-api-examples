@@ -3,122 +3,123 @@ import "dotenv/config";
 import {
   Keypair,
   Connection,
-  clusterApiUrl,
   VersionedTransaction,
+  BlockhashWithExpiryBlockHeight,
+  VersionedTransactionResponse,
 } from "@solana/web3.js";
 import bs58 from "bs58";
-import { NetworkId } from "../../constant";
+import { KANA_API_URL, NetworkId } from "../../constant";
 
 // Constants
 const SOLANA_PRIVATEKEY = "YOUR_SOLANA_PRIVATE_KEY";
 const FROM_TOKEN_ADDRESS = "So11111111111111111111111111111111111111112";
 const TO_TOKEN_ADDRESS = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-
-const AMOUNT_IN = 100000; // 0.01 SOL
-
+const AMOUNT_IN = 10000000; // 0.01 SOL
 const SLIPPAGE_PERCENTAGE = 0.5;
+const RPC_ENDPOINT =
+  process.env.RPC_ENDPOINT || "https://api.mainnet-beta.solana.com";
 
-// Setup Signer
+// Setup connection and signer
+const solanaProvider = new Connection(RPC_ENDPOINT, "confirmed");
 const solanaSigner = Keypair.fromSecretKey(bs58.decode(SOLANA_PRIVATEKEY));
-const solanaProvider = new Connection(
-  clusterApiUrl("mainnet-beta"),
-  "confirmed"
-);
 
-export const sendSolanaTransaction = async (
-  provider: Connection,
-  transaction: VersionedTransaction
-): Promise<string> => {
-  // Pre-serialize the transaction
-  const serializedTx = transaction.serialize();
+async function transactionSenderAndConfirmationWaiter(
+  connection: Connection,
+  serializedTransaction: Buffer,
+  blockhashWithExpiryBlockHeight: BlockhashWithExpiryBlockHeight
+): Promise<VersionedTransactionResponse | null> {
+  const txid = await connection.sendRawTransaction(serializedTransaction, {
+    skipPreflight: true,
+    maxRetries: 0, 
+  });
 
-  // Configure retry strategy
-  const RETRY_INTERVAL_MS = 5000;
-  const MAX_ATTEMPTS = 15;
-  const STATUS_CHECK_TIMEOUT_MS = 5000;
-  const blockhash = transaction.message.recentBlockhash as string;
+  console.log(`📤 Transaction sent: ${txid}`);
 
-  let lastError: Error | null = null;
-  let attempt = 0;
-  let signature: string | null = null;
+  // Set up abort controller for the resender
+  const controller = new AbortController();
+  const abortSignal = controller.signal;
 
-  // Execute retry loop
-  while (attempt < MAX_ATTEMPTS) {
-    attempt++;
+  // Resend transaction every 2 seconds until confirmed or expired
+  const abortableResender = async () => {
+    while (true) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
 
-    try {
-      // If we have a signature, check if confirmed
-      if (signature) {
-        try {
-          const status = await provider.getSignatureStatus(signature, {
-            searchTransactionHistory: true,
-          });
+      if (abortSignal.aborted) return;
 
-          if (
-            status?.value?.confirmationStatus === "confirmed" ||
-            status?.value?.confirmationStatus === "finalized"
-          ) {
-            return signature;
-          }
-        } catch (statusError) {
-          signature = null;
-        }
-      }
-
-      // Send new transaction if needed
-      if (!signature || (attempt > 3 && (attempt - 4) % 3 === 0)) {
-        if (attempt > 1) {
-          await new Promise((resolve) =>
-            setTimeout(resolve, RETRY_INTERVAL_MS)
-          );
-        }
-
-        signature = await provider.sendRawTransaction(serializedTx, {
-          maxRetries: 3,
-          preflightCommitment: "confirmed",
+      try {
+        await connection.sendRawTransaction(serializedTransaction, {
           skipPreflight: true,
+          maxRetries: 0,
         });
-
-        try {
-          await Promise.race([
-            provider.confirmTransaction(
-              { signature, blockhash, lastValidBlockHeight: 0 },
-              "confirmed"
-            ),
-            new Promise((_, reject) =>
-              setTimeout(
-                () => reject(new Error("Timeout")),
-                STATUS_CHECK_TIMEOUT_MS
-              )
-            ),
-          ]);
-          return signature;
-        } catch (confirmError) {
-          // Continue to next iteration
-        }
-      } else {
-        await new Promise((resolve) => setTimeout(resolve, RETRY_INTERVAL_MS));
+        console.log("🔄 Transaction resent");
+      } catch (error: any) {
+        // Ignore errors during resend
+        console.log(`⚠️  Resend attempt failed: ${error.message}`);
       }
-    } catch (error: any) {
-      lastError = error as Error;
-
-      if (error.message.includes("0x1771")) {
-        throw new Error("Slippage: Out Amount less than the slippage amount");
-      }
-
-      signature = null;
     }
+  };
+
+  // Start the resender in background
+  const resenderPromise = abortableResender();
+
+  try {
+    // Wait for confirmation
+    const confirmation = await connection.confirmTransaction(
+      {
+        signature: txid,
+        blockhash: blockhashWithExpiryBlockHeight.blockhash,
+        lastValidBlockHeight:
+          blockhashWithExpiryBlockHeight.lastValidBlockHeight,
+      },
+      "confirmed"
+    );
+
+    // Stop the resender
+    controller.abort();
+    await resenderPromise.catch(() => {}); // Ignore abort errors
+
+    if (confirmation.value.err) {
+      console.error("❌ Transaction failed:", confirmation.value.err);
+      throw new Error(
+        `Transaction failed: ${JSON.stringify(confirmation.value.err)}`
+      );
+    }
+
+    console.log(`✅ Transaction confirmed: ${txid}`);
+
+    // Fetch the transaction details (with retries for RPC sync)
+    let retries = 15;
+    while (retries > 0) {
+      const response = await connection.getTransaction(txid, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+
+      if (response) {
+        return response;
+      }
+
+      // RPC might not be synced yet, wait and retry
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      retries--;
+    }
+
+    console.warn("⚠️  Transaction confirmed but details not yet available");
+    return null;
+  } catch (error: any) {
+    // Stop the resender
+    controller.abort();
+    await resenderPromise.catch(() => {});
+
+    if (error.name === "TransactionExpiredBlockheightExceededError") {
+      console.error("❌ Transaction expired - blockhash is too old");
+    }
+
+    throw error;
   }
-  if (signature) {
-    return signature;
-  }
-  throw (
-    lastError ||
-    new Error(`Failed to send transaction after ${MAX_ATTEMPTS} attempts`)
-  );
-};
+}
 export const kanaswap = async () => {
-  const response = await axios.get("https://ag.kanalabs.io/v1/swapQuote", {
+  const response = await axios.get(`${KANA_API_URL}/v1/swapQuote`, {
     params: {
       inputToken: FROM_TOKEN_ADDRESS, //SOL
       outputToken: TO_TOKEN_ADDRESS, //USDC
@@ -136,26 +137,58 @@ export const kanaswap = async () => {
     quote: response.data?.data[0],
     address: solanaSigner.publicKey.toBase58(),
   };
-  console.log("kanaswap Solana Quote::",data.quote);
   try {
     const response = await axios.post(
-      "https://ag.kanalabs.io/v1/swapInstruction",
+      `${KANA_API_URL}/v1/swapInstruction`,
       data
     );
-    const decodedTransaction = Buffer.from(
-      response.data?.data?.swapTransaction,
-      "base64"
-    );
-    const transaction = VersionedTransaction.deserialize(decodedTransaction);
-    transaction.message.recentBlockhash = (
-      await solanaProvider.getLatestBlockhash("confirmed")
-    ).blockhash;
+
+    const swapTransactionBase64 = response.data?.data?.swapTransaction;
+    if (!swapTransactionBase64) {
+      throw new Error("No swap transaction received from Kana");
+    }
+
+    // Deserialize the transaction
+    const swapTransactionBuf = Buffer.from(swapTransactionBase64, "base64");
+    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+
+    console.log("📝 Transaction deserialized");
+
+    // Get fresh blockhash (critical for confirmation)
+    const blockhashWithExpiryBlockHeight =
+      await solanaProvider.getLatestBlockhash("confirmed");
+
+    // Update transaction with fresh blockhash
+    transaction.message.recentBlockhash =
+      blockhashWithExpiryBlockHeight.blockhash;
+
+    console.log("🔑 Signing transaction...");
+
+    // Sign the transaction
     transaction.sign([solanaSigner]);
-    const submittedTransaction = await sendSolanaTransaction(
+
+    // Send and confirm with Jupiter pattern
+    console.log("🚀 Sending transaction...");
+    const serializedTransaction = Buffer.from(transaction.serialize());
+
+    const result = await transactionSenderAndConfirmationWaiter(
       solanaProvider,
-      transaction
+      serializedTransaction,
+      blockhashWithExpiryBlockHeight
     );
-    console.log(`Submitted transaction hash: ${submittedTransaction}`);
+
+    if (!result) {
+      console.warn("⚠️  Transaction confirmed but details unavailable");
+    } else if (result.meta?.err) {
+      throw new Error(`Transaction failed: ${JSON.stringify(result.meta.err)}`);
+    }
+
+    const signature = bs58.encode(transaction.signatures[0]);
+
+    console.log("\n✨ Swap completed successfully!");
+    console.log(`🔗 View on Solscan: https://solscan.io/tx/${signature}`);
+
+    return signature;
   } catch (error) {
     console.error("Error posting swap instruction:", error);
     throw error;

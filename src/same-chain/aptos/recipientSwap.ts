@@ -1,7 +1,7 @@
 import axios from "axios";
 import "dotenv/config";
 import { Account, AccountAddress, Aptos, AptosConfig, Ed25519PrivateKey, Network, PrivateKey, PrivateKeyVariants } from "@aptos-labs/ts-sdk";
-import { NetworkId } from "../../constant";
+import { KANA_API_URL, NetworkId } from "../../constant";
 
 const config = new AptosConfig({ network: Network.MAINNET });
 const aptos = new Aptos(config);
@@ -25,7 +25,7 @@ const sender = Account.fromPrivateKey({
   });
   
 export const kanaswap = async () => {
-const response = await axios.get("https://ag.kanalabs.io/v1/swapQuote", {
+const response = await axios.get(`${KANA_API_URL}/v1/swapQuote`, {
     params: {
       inputToken: FROM_TOKEN_ADDRESS, //APT
       outputToken: TO_TOKEN_ADDRESS, //USDt
@@ -41,7 +41,7 @@ const response = await axios.get("https://ag.kanalabs.io/v1/swapQuote", {
   });
 
   const swapInstruction = await axios.post(
-    "https://ag.kanalabs.io/v1/swapInstruction",
+    `${KANA_API_URL}/v1/swapInstruction`,
     {
       quote: response.data?.data[0],
       address: APTOS_ADDRESS,
