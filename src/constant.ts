@@ -11,3 +11,4 @@ export enum NetworkId {
     'Avalanche' = 10,
     'Arbitrum' = 11,
 }
+export const KANA_DIAMOND_ADDRESS = "0xA1BB807fF6701f4e1b404Eb35Da55d8E9f3fb25c";

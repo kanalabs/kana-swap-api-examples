@@ -1,6 +1,6 @@
 /**
- * Example: Aptos → EVM cross-chain swap (FULL FLOW)
- * Burn → Attestation → Claim → Mint
+ * Aptos → Polygon cross-chain swap
+ * Burn → Attestation → Claim → Mint USDC → Swap to POL (MATIC)
  */
 
 import axios from "axios";
@@ -16,18 +16,16 @@ import {
   PrivateKeyVariants,
 } from "@aptos-labs/ts-sdk";
 
-import { ethers } from "ethers";
-import { BigNumber } from "@ethersproject/bignumber";
-
+import { ethers, BigNumber } from "ethers";
 import { KANA_API_URL, NetworkId } from "../constant";
 
 /* -------------------------------------------------------------------------- */
-/*                                CONFIG                                      */
+/* CONFIG                                                                      */
 /* -------------------------------------------------------------------------- */
 
-const SOURCE_TOKEN = "0x1::aptos_coin::AptosCoin"; // APT
-const TARGET_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"; // AVAX (EVM native)
-const AMOUNT_IN = "1000000"; // 0.1 APT
+const SOURCE_TOKEN = "0x1::aptos_coin::AptosCoin";
+const TARGET_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"; // POL / MATIC
+const AMOUNT_IN = "1000000";
 const SLIPPAGE = 0.5;
 
 const headers = {
@@ -37,9 +35,7 @@ const headers = {
 
 /* ----------------------------- APTOS SETUP -------------------------------- */
 
-const aptos = new Aptos(
-  new AptosConfig({ network: Network.MAINNET })
-);
+const aptos = new Aptos(new AptosConfig({ network: Network.MAINNET }));
 
 const aptosAccount = new Ed25519Account({
   privateKey: new Ed25519PrivateKey(
@@ -50,29 +46,103 @@ const aptosAccount = new Ed25519Account({
   ),
 });
 
-/* ------------------------------ EVM SETUP --------------------------------- */
+/* ------------------------------ POLYGON SETUP ----------------------------- */
 
-const evmProvider = new ethers.providers.JsonRpcProvider(
-  process.env.AVALANCHE_RPC_URL!
+const provider = new ethers.providers.JsonRpcProvider(
+  process.env.POLYGON_RPC_URL!
 );
 
-const evmSigner = new ethers.Wallet(
+(provider as any)._isEip1559 = false;
+
+const signer = new ethers.Wallet(
   process.env.EVM_PRIVATE_KEY!,
-  evmProvider
+  provider
 );
 
+/* ------------------------- EVM EXECUTOR (REUSED) -------------------------- */
+
+interface TransactionIX {
+  to: string;
+  from: string;
+  value: string;
+  data: string;
+  gasPrice: string;
+  chainId: number;
+}
+
+interface SwapIX {
+  approveIX?: TransactionIX;
+  swapIX: TransactionIX;
+}
+
+function increaseGasLimit(gas: number) {
+  return Math.ceil(gas * 1.1);
+}
+
+async function executeEVMInstruction(
+  signer: ethers.Wallet,
+  instruction: SwapIX
+) {
+  const provider = signer.provider!;
+  const gasPrice = await provider.getGasPrice(); // legacy gas
+
+  if (instruction.approveIX) {
+    const a = instruction.approveIX;
+
+    const approveTx = {
+      from: a.from,
+      to: a.to,
+      data: a.data,
+      value: BigNumber.from(a.value),
+      gasPrice,
+      chainId: a.chainId,
+    };
+
+    const gas = await provider.estimateGas(approveTx);
+    const tx = await signer.sendTransaction({
+      ...approveTx,
+      gasLimit: gas.mul(110).div(100), // +10%
+    });
+
+    await tx.wait();
+  }
+
+  const s = instruction.swapIX;
+
+  const swapTx = {
+    from: s.from,
+    to: s.to,
+    data: s.data,
+    value: BigNumber.from(s.value),
+    gasPrice,
+    chainId: s.chainId,
+  };
+
+  const gas = await provider.estimateGas(swapTx);
+  const tx = await signer.sendTransaction({
+    ...swapTx,
+    gasLimit: gas.mul(110).div(100),
+  });
+
+  const receipt = await tx.wait();
+  return receipt.transactionHash;
+}
+
+
 /* -------------------------------------------------------------------------- */
-/*                                MAIN FLOW                                   */
+/* MAIN FLOW                                                                   */
 /* -------------------------------------------------------------------------- */
 
-async function aptosToEvmSwap() {
+async function aptosToPolygonSwap() {
+  console.log("🚀 Aptos → Polygon swap started");
+
   /* --------------------------- 1. QUOTE ---------------------------------- */
   const quoteRes = await axios.get(`${KANA_API_URL}/v1/crossChainQuote`, {
     params: {
       sourceToken: SOURCE_TOKEN,
       targetToken: TARGET_TOKEN,
       sourceChain: NetworkId.aptos,
-      targetChain: NetworkId.Avalanche,
+      targetChain: NetworkId.polygon,
       amountIn: AMOUNT_IN,
       sourceSlippage: SLIPPAGE,
       targetSlippage: SLIPPAGE,
@@ -83,44 +153,43 @@ async function aptosToEvmSwap() {
   const quote = quoteRes.data.data[0];
   console.log("✅ Quote fetched");
 
-  /* ---------------------- 2. BUILD SOURCE INSTRUCTIONS -------------------- */
-  const instructionRes = await axios.post(
+  /* ---------------------- 2. SOURCE INSTRUCTIONS -------------------------- */
+  const transferRes = await axios.post(
     `${KANA_API_URL}/v1/crossChainTransfer`,
     {
       quote,
       sourceAddress: aptosAccount.accountAddress.toString(),
-      targetAddress: await evmSigner.getAddress(),
+      targetAddress: signer.address,
     },
     { headers }
   );
 
-  const instruction = instructionRes.data.data;
+  const instruction = transferRes.data.data;
   console.log("✅ Source instructions built");
 
-  /* -------------------- 3. EXECUTE ON APTOS (BURN) ------------------------ */
+  /* -------------------- 3. EXECUTE ON APTOS ------------------------------- */
   const aptosTxHash = await executeAptosInstruction(
     aptos,
     aptosAccount,
     instruction
   );
+  console.log("🔥 Burn executed:", aptosTxHash);
 
-  console.log("🔥 Burn executed on Aptos:", aptosTxHash);
-
-  /* -------------------- 4. WAIT FOR CCTP ATTESTATION ---------------------- */
+  /* -------------------- 4. ATTESTATION ----------------------------------- */
   const { messageBytes, attestationSignature } =
     await waitForAttestation({
       sourceChain: NetworkId.aptos,
       txHash: aptosTxHash,
     });
 
-  console.log("🟢 CCTP attestation ready");
+  console.log("🟢 Attestation ready");
 
-  /* -------------------- 5. CLAIM (HAPPY FLOW) ----------------------------- */
+  /* -------------------- 5. CLAIM → MINT USDC ------------------------------ */
   const claimRes = await axios.post(
     `${KANA_API_URL}/v1/claim`,
     {
       quote,
-      targetAddress: await evmSigner.getAddress(),
+      targetAddress: signer.address,
       messageBytes,
       attestationSignature,
     },
@@ -128,25 +197,54 @@ async function aptosToEvmSwap() {
   );
 
   const claimIx = claimRes.data.data.claimIx;
-  console.log("✅ Claim instruction received");
 
-  /* -------------------- 6. EXECUTE ON EVM (MINT) -------------------------- */
-  const tx = await evmSigner.sendTransaction({
+  const mintTx = await signer.sendTransaction({
     to: claimIx.to,
     data: claimIx.data,
-    value: BigNumber.from(claimIx.value),
-    gasPrice: BigNumber.from(claimIx.gasPrice),
+    value: BigNumber.from(claimIx.value || 0),
   });
 
-  const receipt = await tx.wait();
-  console.log("🎉 Minted on EVM:", receipt.transactionHash);
+  console.log("⏳ Minting USDC on Polygon...");
+  await mintTx.wait();
+  console.log("🎉 Mint confirmed");
+
+  /* -------------------- 6. TARGET SWAP (KEY FIX) -------------------------- */
+
+  if (!quote.targetSwapRoute) {
+    console.log("🏁 No target swap required");
+    return;
+  }
+
+  const swapQuoteRes = await axios.get(`${KANA_API_URL}/v1/swapQuote`, {
+    params: {
+      inputToken: quote.targetSwapRoute.sourceToken,
+      outputToken: quote.targetSwapRoute.targetToken,
+      chain: NetworkId.polygon,
+      amountIn: quote.targetSwapRoute.amountIn,
+      slippage: SLIPPAGE,
+    },
+    headers,
+  });
+
+  const swapInstructionRes = await axios.post(
+    `${KANA_API_URL}/v1/swapInstruction`,
+    {
+      quote: swapQuoteRes.data.data[0],
+      address: signer.address,
+    },
+    { headers }
+  );
+
+  console.log("⏳ Swapping USDC → POL...");
+  const hash = await executeEVMInstruction(
+    signer,
+    swapInstructionRes.data.data
+  );
+
+  console.log("🚀 Final swap complete:", hash);
 }
 
-aptosToEvmSwap();
-
-/* -------------------------------------------------------------------------- */
-/*                              HELPERS                                       */
-/* -------------------------------------------------------------------------- */
+aptosToPolygonSwap();
 
 function normalizeAptosPayload(payload: any) {
   return {
@@ -159,59 +257,50 @@ function normalizeAptosPayload(payload: any) {
 async function executeAptosInstruction(
   aptos: Aptos,
   signer: Ed25519Account,
-  instruction: {
-    swapPayload?: any;
-    bridgePayload?: any;
-  }
+  instruction: any
 ): Promise<string> {
-  let lastTxHash = "";
+  let lastTx = "";
 
-  // 1️⃣ SOURCE SWAP (APT → USDC)
   if (instruction.swapPayload) {
-    const swapTx = await aptos.transaction.build.simple({
+    const tx = await aptos.transaction.build.simple({
       sender: signer.accountAddress.toString(),
       data: normalizeAptosPayload(instruction.swapPayload),
     });
 
-    const swapRes = await aptos.signAndSubmitTransaction({
+    const res = await aptos.signAndSubmitTransaction({
       signer,
-      transaction: swapTx,
+      transaction: tx,
     });
 
     await aptos.waitForTransaction({
-      transactionHash: swapRes.hash,
+      transactionHash: res.hash,
       options: { checkSuccess: true },
     });
 
-    console.log("🔁 Aptos swap executed:", swapRes.hash);
-    lastTxHash = swapRes.hash;
+    lastTx = res.hash;
   }
 
-  // 2️⃣ BRIDGE BURN (USDC burn → CCTP)
   if (instruction.bridgePayload) {
-    const bridgeTx = await aptos.transaction.build.simple({
+    const tx = await aptos.transaction.build.simple({
       sender: signer.accountAddress.toString(),
       data: normalizeAptosPayload(instruction.bridgePayload),
     });
 
-    const bridgeRes = await aptos.signAndSubmitTransaction({
+    const res = await aptos.signAndSubmitTransaction({
       signer,
-      transaction: bridgeTx,
+      transaction: tx,
     });
 
     await aptos.waitForTransaction({
-      transactionHash: bridgeRes.hash,
+      transactionHash: res.hash,
       options: { checkSuccess: true },
     });
 
-    console.log("🔥 Aptos burn executed:", bridgeRes.hash);
-    lastTxHash = bridgeRes.hash;
+    lastTx = res.hash;
   }
 
-  return lastTxHash;
+  return lastTx;
 }
-
-/* ------------------------- CCTP ATTESTATION POLLING ------------------------ */
 
 const CIRCLE_ATTESTATION_API = "https://iris-api.circle.com";
 
@@ -222,6 +311,7 @@ const CHAIN_TO_CCTP_ID: Record<number, number> = {
   [NetworkId.solana]: 5,
   [NetworkId.base]: 6,
   [NetworkId.polygon]: 7,
+  [NetworkId.sui]: 8,
   [NetworkId.aptos]: 9,
 };
 
@@ -231,12 +321,7 @@ async function waitForAttestation(params: {
 }) {
   const { sourceChain, txHash } = params;
 
-  const pollIntervalMs = 3000;
-  const maxRetries = 300;
-
-  let retries = 0;
-
-  while (retries < maxRetries) {
+  while (true) {
     const url = `${CIRCLE_ATTESTATION_API}/messages/${CHAIN_TO_CCTP_ID[sourceChain]}/${txHash}`;
     const res = await fetch(url);
     const json = await res.json();
@@ -249,9 +334,6 @@ async function waitForAttestation(params: {
       };
     }
 
-    retries++;
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
+    await new Promise((r) => setTimeout(r, 3000));
   }
-
-  throw new Error("CCTP attestation timeout");
 }
