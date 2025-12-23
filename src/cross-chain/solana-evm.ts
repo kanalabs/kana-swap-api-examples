@@ -1,6 +1,10 @@
 /**
- * Example: Solana → Avalanche (USDC) cross-chain swap
- * Burn → Attestation → Claim → Mint
+ * Solana (SOL) → Avalanche (AVAX)
+ * Flow:
+ * 1. Source Swap: SOL → USDC (using sourceSwapRoute from Quote)
+ * 2. Bridge: USDC → USDC (via CCTP)
+ * 3. Claim: Mint USDC on Avalanche
+ * 4. Target Swap: USDC → AVAX (using targetSwapRoute logic)
  */
 
 import axios from "axios";
@@ -11,57 +15,58 @@ import {
   Keypair,
   VersionedTransaction,
   clusterApiUrl,
+  PublicKey,
 } from "@solana/web3.js";
 
 import { ethers } from "ethers";
+import { BigNumber } from "@ethersproject/bignumber";
 import bs58 from "bs58";
 
 import { KANA_API_URL, NetworkId } from "../constant";
 
 /* -------------------------------------------------------------------------- */
-/*                                  CONFIG                                    */
+/* CONFIG                                    */
 /* -------------------------------------------------------------------------- */
 
-const SOURCE_TOKEN = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
-const TARGET_TOKEN =
-  "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"; // USDC (Avalanche)
+const SOURCE_TOKEN = "So11111111111111111111111111111111111111112"; // SOL
+const TARGET_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"; // AVAX
 
-const AMOUNT_IN = "100000";
-const SLIPPAGE = 0.5;
+const AMOUNT_IN = "10000000"; // 0.01 SOL
+const SLIPPAGE = 1.0; 
 
 const headers = {
   "Content-Type": "application/json",
   "X-API-KEY": process.env.XYRA_API_KEY!,
 };
 
-/* ---------------------------- SOLANA SETUP -------------------------------- */
+/* --------------------------- SETUP ---------------------------------------- */
 
+// Solana
 const solanaConnection = new Connection(
-  clusterApiUrl("mainnet-beta"),
+  process.env.SOLANA_RPC_URL || clusterApiUrl("mainnet-beta"),
   "confirmed"
 );
-
 const solanaSigner = Keypair.fromSecretKey(
   bs58.decode(process.env.SOLANA_PRIVATE_KEY!)
 );
 
-/* --------------------------- AVALANCHE SETUP ------------------------------ */
-
+// Avalanche
 const avaxProvider = new ethers.providers.JsonRpcProvider(
   process.env.AVALANCHE_RPC_URL!
 );
-
 const avaxSigner = new ethers.Wallet(
   process.env.EVM_PRIVATE_KEY!,
   avaxProvider
 );
 
 /* -------------------------------------------------------------------------- */
-/*                                  MAIN FLOW                                 */
+/* MAIN FLOW                                   */
 /* -------------------------------------------------------------------------- */
 
-async function solanaToAvalancheSwap() {
-  /* --------------------------- 1. QUOTE ---------------------------------- */
+async function solanaToAvalancheFlow() {
+  console.log("🚀 Starting Flow: SOL (Solana) -> AVAX (Avalanche)");
+
+  /* -------------------- 1. FETCH CROSS-CHAIN QUOTE ----------------------- */
   const quoteRes = await axios.get(`${KANA_API_URL}/v1/crossChainQuote`, {
     params: {
       sourceToken: SOURCE_TOKEN,
@@ -78,43 +83,85 @@ async function solanaToAvalancheSwap() {
   const quote = quoteRes.data.data[0];
   console.log("✅ Quote fetched");
 
-  /* ------------------ 2. BUILD SOURCE INSTRUCTIONS ------------------------ */
+  /* -------------------- 2. SOURCE SWAP (SOL -> USDC) --------------------- */
+  let bridgedAmount = quote.inAmount; // Default if no swap needed
+
+  if (quote.sourceSwapRoute) {
+    console.log("🔄 Executing Source Swap (SOL -> USDC)...");
+    
+    // We use the route details directly from the cross-chain quote
+    const swapTxRes = await axios.post(
+      `${KANA_API_URL}/v1/swapInstruction`,
+      {
+        quote: quote.sourceSwapRoute,
+        address: solanaSigner.publicKey.toBase58(),
+      },
+      { headers }
+    );
+    const swapSig = await executeSolanaTx(
+      solanaConnection,
+      solanaSigner,
+      swapTxRes.data.data.swapTransaction
+    );
+    
+    console.log("✅ Source Swap Complete! Tx:", swapSig);
+    
+    // Update amount for the bridge step
+    bridgedAmount = quote.sourceSwapRoute.amountOutWithSlippage;
+    
+    console.log("⏳ Waiting 5s for balance sync...");
+    await new Promise(r => setTimeout(r, 5000));
+  }
+
+  /* -------------------- 3. BRIDGE (USDC -> USDC) ------------------------- */
+  console.log("🌉 Initiating Bridge (USDC -> USDC)...");
+
+  const bridgeQuoteRes = await axios.get(`${KANA_API_URL}/v1/crossChainQuote`, {
+    params: {
+      sourceToken: quote.sourceBridgeToken, // USDC (EPj...)
+      targetToken: quote.targetBridgeToken, // USDC (0xB97...)
+      sourceChain: NetworkId.solana,
+      targetChain: NetworkId.Avalanche,
+      amountIn: bridgedAmount, 
+      sourceSlippage: SLIPPAGE,
+      targetSlippage: SLIPPAGE,
+    },
+    headers,
+  });
+  
+  const bridgeQuote = bridgeQuoteRes.data.data[0];
+
   const transferRes = await axios.post(
     `${KANA_API_URL}/v1/crossChainTransfer`,
     {
-      quote,
+      quote: bridgeQuote,
       sourceAddress: solanaSigner.publicKey.toBase58(),
       targetAddress: await avaxSigner.getAddress(),
     },
     { headers }
   );
 
-  const instruction = transferRes.data.data;
-  console.log("✅ Source instructions built");
-
-  /* ------------------ 3. EXECUTE ON SOLANA (BURN) ------------------------- */
-  const solanaTxHash = await executeSolanaTx(
+  const burnTxHash = await executeSolanaTx(
     solanaConnection,
     solanaSigner,
-    instruction.transferTx
+    transferRes.data.data.transferTx
   );
+  console.log("🔥 Burn FINALIZED on Solana:", burnTxHash);
 
-  console.log("🔥 Burn executed on Solana:", solanaTxHash);
-
-  /* ------------------ 4. WAIT FOR CCTP ATTESTATION ------------------------ */
+  /* -------------------- 4. WAIT FOR ATTESTATION -------------------------- */
+  console.log("⏳ Polling for CCTP Attestation...");
   const { messageBytes, attestationSignature } =
-    await waitForAttestation({
-      sourceChain: NetworkId.solana,
-      txHash: solanaTxHash,
-    });
+    await waitForCctpAttestation(burnTxHash);
 
-  console.log("🟢 CCTP attestation ready");
+  console.log("🟢 CCTP Attestation Ready!");
 
-  /* ------------------ 5. CLAIM (HAPPY FLOW) ------------------------------- */
+  /* -------------------- 5. CLAIM (MINT USDC) ----------------------------- */
+  console.log("📥 Claiming USDC on Avalanche...");
+  
   const claimRes = await axios.post(
     `${KANA_API_URL}/v1/claim`,
     {
-      quote,
+      quote: bridgeQuote,
       targetAddress: await avaxSigner.getAddress(),
       messageBytes,
       attestationSignature,
@@ -123,23 +170,58 @@ async function solanaToAvalancheSwap() {
   );
 
   const claimIx = claimRes.data.data.claimIx;
-  console.log("✅ Claim instruction received");
-
-  /* ------------------ 6. EXECUTE ON AVALANCHE (MINT) ---------------------- */
-  const tx = await avaxSigner.sendTransaction({
+  
+  const mintTx = await avaxSigner.sendTransaction({
     to: claimIx.to,
     data: claimIx.data,
-    value: BigInt(claimIx.value),
+    value: BigNumber.from(claimIx.value || 0),
   });
 
-  const receipt = await tx.wait();
-  console.log("🎉 USDC minted on Avalanche:", receipt!.transactionHash);
+  const mintReceipt = await mintTx.wait();
+  console.log("🎉 USDC Minted on Avalanche:", mintReceipt.transactionHash);
+
+  console.log("⏳ Waiting 3s for EVM sync...");
+  await new Promise(r => setTimeout(r, 3000));
+
+  /* -------------------- 6. TARGET SWAP (USDC -> AVAX) -------------------- */
+  if (quote.targetSwapRoute) {
+    console.log("🔄 Executing Target Swap (USDC -> AVAX)...");
+    
+    const avaxSwapQuoteRes = await axios.get(`${KANA_API_URL}/v1/swapQuote`, {
+      params: {
+        inputToken: quote.targetSwapRoute.sourceToken, // USDC
+        outputToken: quote.targetSwapRoute.targetToken, // AVAX
+        chain: NetworkId.Avalanche,
+        amountIn: bridgeQuote.outAmount,
+        slippage: SLIPPAGE,
+      },
+      headers,
+    });
+
+    const avaxSwapQuote = avaxSwapQuoteRes.data.data[0];
+
+    const avaxSwapTxRes = await axios.post(
+      `${KANA_API_URL}/v1/swapInstruction`,
+      {
+        quote: avaxSwapQuote,
+        address: await avaxSigner.getAddress(),
+      },
+      { headers }
+    );
+
+    const swapInstruction = avaxSwapTxRes.data.data;
+
+    const swapHash = await executeTargetEVMInstruction(avaxSigner, swapInstruction);
+    console.log("🚀 FINAL SUCCESS! Swapped to AVAX. Hash:", swapHash);
+  } else {
+    console.log("🏁 No target swap required.");
+  }
 }
 
-solanaToAvalancheSwap();
+solanaToAvalancheFlow().catch(console.error);
 
 /* -------------------------------------------------------------------------- */
-/*                                HELPERS                                     */
+/* HELPERS                                                                    */
 /* -------------------------------------------------------------------------- */
 
 async function executeSolanaTx(
@@ -147,65 +229,110 @@ async function executeSolanaTx(
   signer: Keypair,
   base64Tx: string
 ): Promise<string> {
-  const tx = VersionedTransaction.deserialize(
-    Buffer.from(base64Tx, "base64")
-  );
-
+  const tx = VersionedTransaction.deserialize(Buffer.from(base64Tx, "base64"));
   tx.sign([signer]);
 
   const sig = await connection.sendRawTransaction(tx.serialize(), {
     skipPreflight: false,
     preflightCommitment: "confirmed",
   });
+  console.log("⏳ Sent Solana Tx:", sig);
 
-  const { blockhash, lastValidBlockHeight } =
-    await connection.getLatestBlockhash("confirmed");
-
-  await connection.confirmTransaction(
-    {
-      signature: sig,
-      blockhash,
-      lastValidBlockHeight,
-    },
+  const latest = await connection.getLatestBlockhash("confirmed");
+  const status = await connection.confirmTransaction(
+    { signature: sig, ...latest },
     "finalized"
   );
 
+  if (status.value.err) throw new Error("Transaction failed");
   return sig;
 }
 
-/* ---------------------- CCTP ATTESTATION POLLING -------------------------- */
+async function forceApprove(
+    signer: ethers.Wallet, 
+    tokenAddress: string, 
+    spender: string, 
+    amount: any
+) {
+    console.log(`🛡️  Checking Approval for ${tokenAddress}...`);
+    const abi = ["function approve(address spender, uint256 amount) public returns (bool)"];
+    const tokenContract = new ethers.Contract(tokenAddress, abi, signer);
+    try {
+        const tx = await tokenContract.approve(spender, amount);
+        console.log("⏳ Sending Approval...");
+        await tx.wait();
+        console.log("✅ Approved:", tx.hash);
+    } catch (e: any) {
+        console.log("⚠️ Approval check skipped/failed:", e.message);
+    }
+}
 
-const CIRCLE_ATTESTATION_API = "https://iris-api.circle.com";
+async function executeTargetEVMInstruction(signer: ethers.Wallet, instruction: any) {
+  
+  if (instruction.approveIX) {
+    const txParams = instruction.approveIX;
+    console.log(`🛡️  Approving Token... Spender: ${txParams.to}`);
 
-const CHAIN_TO_CCTP_ID: Record<number, number> = {
-  [NetworkId.ethereum]: 0,
-  [NetworkId.Avalanche]: 1,
-  [NetworkId.Arbitrum]: 3,
-  [NetworkId.solana]: 5,
-  [NetworkId.base]: 6,
-  [NetworkId.polygon]: 7,
-  [NetworkId.aptos]: 9,
-};
+    const approveTX: ethers.providers.TransactionRequest & { gasLimit?: string } = {
+      from: txParams.from,
+      to: txParams.to,
+      data: txParams.data,
+      chainId: txParams.chainId,
+      gasPrice: txParams.gasPrice ? BigNumber.from(txParams.gasPrice).toHexString() : undefined,
+      value: BigNumber.from(txParams.value || 0).toHexString(),
+    };
 
-async function waitForAttestation(params: {
-  sourceChain: NetworkId;
-  txHash: string;
-}) {
-  const { sourceChain, txHash } = params;
-
-  while (true) {
-    const url = `${CIRCLE_ATTESTATION_API}/messages/${CHAIN_TO_CCTP_ID[sourceChain]}/${txHash}`;
-    const res = await fetch(url);
-    const json = await res.json();
-
-    const msg = json?.messages?.[0];
-    if (msg && msg.attestation !== "PENDING") {
-      return {
-        messageBytes: msg.message,
-        attestationSignature: msg.attestation,
-      };
+    try {
+        const gasLimit = await signer.estimateGas(approveTX);
+        approveTX["gasLimit"] = gasLimit.mul(110).div(100).toHexString();
+    } catch (e) {
+        console.log("⚠️ Gas estimation for approval failed, using fallback.");
+        approveTX["gasLimit"] = ethers.utils.hexlify(150000); 
     }
 
-    await new Promise((r) => setTimeout(r, 4000));
+    const tx = await signer.sendTransaction(approveTX);
+    console.log("⏳ Sending Approval...");
+    await tx.wait();
+    console.log("✅ Approval Confirmed:", tx.hash);
+  }
+
+  if (instruction.swapIX) {
+    const txParams = instruction.swapIX;
+    console.log("⏳ Sending Swap Tx...");
+
+    const swapTX: ethers.providers.TransactionRequest & { gasLimit?: string } = {
+      from: txParams.from,
+      to: txParams.to,
+      data: txParams.data,
+      chainId: txParams.chainId,
+      gasPrice: txParams.gasPrice ? BigNumber.from(txParams.gasPrice).toHexString() : undefined,
+      value: BigNumber.from(txParams.value || 0).toHexString(),
+    };
+
+    swapTX["gasLimit"] = ethers.utils.hexlify(1000000); 
+    console.log(JSON.stringify(swapTX, null, 2));
+    const tx = await signer.sendTransaction(swapTX);
+    const receipt = await tx.wait();
+    return receipt.transactionHash;
+  }
+  
+  throw new Error("No swap instructions found in API response");
+}
+
+/* ---------------------- CCTP ATTESTATION POLLING -------------------------- */
+const CIRCLE_ATTESTATION_API = "https://iris-api.circle.com";
+
+async function waitForCctpAttestation(txHash: string) {
+  const cctpChainId = 5; // Solana
+  while (true) {
+    try {
+        const res = await fetch(`${CIRCLE_ATTESTATION_API}/messages/${cctpChainId}/${txHash}`);
+        const json = await res.json();
+        const msg = json?.messages?.[0];
+        if (msg && msg.attestation !== "PENDING") {
+            return { messageBytes: msg.message, attestationSignature: msg.attestation };
+        }
+    } catch(e) {}
+    await new Promise((r) => setTimeout(r, 5000));
   }
 }
