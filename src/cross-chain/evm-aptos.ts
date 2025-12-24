@@ -1,6 +1,5 @@
 /**
- * Example: EVM → Aptos Cross-Chain Swap (FULL FLOW)
- * Burn → Attestation → Claim → Mint
+ * Polygon (POL/MATIC) → Aptos (APT)
  */
 
 import axios from "axios";
@@ -22,14 +21,13 @@ import { BigNumber } from "@ethersproject/bignumber";
 import { KANA_API_URL, NetworkId } from "../constant";
 
 /* -------------------------------------------------------------------------- */
-/*                                   CONFIG                                   */
+/* CONFIG                                                                     */
 /* -------------------------------------------------------------------------- */
 
-const SOURCE_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"; // AVAX
-const TARGET_TOKEN =
-  "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b"; // USDC (Aptos)
+const SOURCE_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"; // POL / MATIC
+const TARGET_TOKEN = "0x1::aptos_coin::AptosCoin"; // APT
 
-const AMOUNT_IN = "10000000000000000"; // 0.01 AVAX
+const AMOUNT_IN = "1000000000000000000"; // 1 POL
 const SLIPPAGE = 0.5;
 
 const headers = {
@@ -37,22 +35,20 @@ const headers = {
   "X-API-KEY": process.env.XYRA_API_KEY!,
 };
 
-/* ------------------------------- EVM -------------------------------------- */
+/* ----------------------------- POLYGON SETUP ------------------------------ */
 
-const evmProvider = new ethers.providers.JsonRpcProvider(
-  process.env.AVALANCHE_RPC_URL!
+const polygonProvider = new ethers.providers.JsonRpcProvider(
+  process.env.POLYGON_RPC_URL!
 );
 
-const evmSigner = new ethers.Wallet(
+const polygonSigner = new ethers.Wallet(
   process.env.EVM_PRIVATE_KEY!,
-  evmProvider
+  polygonProvider
 );
 
-/* ------------------------------- APTOS ------------------------------------ */
+/* ------------------------------ APTOS SETUP ------------------------------- */
 
-const aptos = new Aptos(
-  new AptosConfig({ network: Network.MAINNET })
-);
+const aptos = new Aptos(new AptosConfig({ network: Network.MAINNET }));
 
 const aptosAccount = new Ed25519Account({
   privateKey: new Ed25519PrivateKey(
@@ -64,16 +60,20 @@ const aptosAccount = new Ed25519Account({
 });
 
 /* -------------------------------------------------------------------------- */
-/*                                MAIN FLOW                                   */
+/* MAIN FLOW                                                                  */
 /* -------------------------------------------------------------------------- */
 
-async function evmToAptosSwap() {
+async function polygonToAptosSwap() {
+  console.log("🚀 Starting Flow: POL (Polygon) -> APT (Aptos)");
+  console.log(`👤 Polygon User: ${await polygonSigner.getAddress()}`);
+  console.log(`👤 Aptos User: ${aptosAccount.accountAddress.toString()}`);
+
   /* ----------------------------- 1. QUOTE -------------------------------- */
   const quoteRes = await axios.get(`${KANA_API_URL}/v1/crossChainQuote`, {
     params: {
       sourceToken: SOURCE_TOKEN,
       targetToken: TARGET_TOKEN,
-      sourceChain: NetworkId.Avalanche,
+      sourceChain: NetworkId.polygon,
       targetChain: NetworkId.aptos,
       amountIn: AMOUNT_IN,
       sourceSlippage: SLIPPAGE,
@@ -83,14 +83,14 @@ async function evmToAptosSwap() {
   });
 
   const quote = quoteRes.data.data[0];
-  console.log("✅ Quote fetched");
+  console.log(`✅ Quote fetched. Est Output: ${quote.outAmount}`);
 
   /* -------------------- 2. BUILD SOURCE INSTRUCTIONS ---------------------- */
   const transferRes = await axios.post(
     `${KANA_API_URL}/v1/crossChainTransfer`,
     {
       quote,
-      sourceAddress: await evmSigner.getAddress(),
+      sourceAddress: await polygonSigner.getAddress(),
       targetAddress: aptosAccount.accountAddress.toString(),
     },
     { headers }
@@ -99,24 +99,27 @@ async function evmToAptosSwap() {
   const instruction = transferRes.data.data;
   console.log("✅ Source instructions built");
 
-  /* -------------------- 3. EXECUTE BURN ON EVM ---------------------------- */
+  /* -------------------- 3. EXECUTE SWAP & BURN ON EVM --------------------- */
   const burnTxHash = await executeEvmInstruction(
-    evmSigner,
+    polygonSigner,
     instruction
   );
 
-  console.log("🔥 Burn executed on EVM:", burnTxHash);
+  console.log("🔥 Atomic Swap & Burn executed on Polygon:", burnTxHash);
 
   /* -------------------- 4. WAIT FOR CCTP ATTESTATION ---------------------- */
+  console.log("⏳ Polling for CCTP Attestation...");
   const { messageBytes, attestationSignature } =
     await waitForAttestation({
-      sourceChain: NetworkId.Avalanche,
+      sourceChain: NetworkId.polygon,
       txHash: burnTxHash,
     });
 
-  console.log("🟢 CCTP attestation ready");
+  console.log("🟢 CCTP Attestation Ready");
 
-  /* -------------------- 5. CLAIM (HAPPY FLOW) ----------------------------- */
+  /* -------------------- 5. CLAIM (MINT USDC ON APTOS) --------------------- */
+  console.log("📥 Claiming USDC on Aptos...");
+  
   const claimRes = await callClaimWithRetry({
     quote,
     targetAddress: aptosAccount.accountAddress.toString(),
@@ -125,76 +128,100 @@ async function evmToAptosSwap() {
   });
 
   const claimPayload = claimRes.data.data.claimPayload;
-  console.log("✅ Claim payload received");
-
-  /* -------------------- 6. EXECUTE MINT ON APTOS -------------------------- */
-  const mintTxHash = await executeAptosInstruction(
+  
+  await executeAptosInstruction(
     aptos,
     aptosAccount,
     claimPayload
   );
 
-  console.log("🎉 Minted on Aptos:", mintTxHash);
+  console.log("🎉 USDC Minted on Aptos");
+
+  /* -------------------- 6. TARGET SWAP (USDC -> APT) ---------------------- */
+  if (quote.targetSwapRoute) {
+    console.log("🔄 Step 3: Executing Target Swap (USDC -> APT)...");
+
+    const swapInstructionRes = await axios.post(
+      `${KANA_API_URL}/v1/swapInstruction`,
+      {
+        quote: quote.targetSwapRoute, 
+        address: aptosAccount.accountAddress.toString(),
+      },
+      { headers }
+    );
+
+    const finalHash = await executeAptosInstruction(
+      aptos,
+      aptosAccount,
+      swapInstructionRes.data.data
+    );
+    
+    console.log("🚀 Final Swap Complete! Hash:", finalHash);
+  } else {
+    console.log("🏁 No target swap needed.");
+  }
 }
 
-evmToAptosSwap();
+polygonToAptosSwap().catch(console.error);
 
 /* -------------------------------------------------------------------------- */
-/*                                  HELPERS                                   */
+/* HELPERS                                                                    */
 /* -------------------------------------------------------------------------- */
 
-/* ----------------------- EXECUTE EVM TX ----------------------------------- */
 async function executeEvmInstruction(
   signer: ethers.Wallet,
   instruction: any
 ): Promise<string> {
+  // 1. Handle Approve (if exists)
   if (instruction.approveIX) {
+    const ix = instruction.approveIX;
+    console.log("   -> Approving Token...");
+    
     const tx = await signer.sendTransaction({
-      to: instruction.approveIX.to,
-      data: instruction.approveIX.data,
-      value: BigNumber.from(instruction.approveIX.value),
-      gasPrice: BigNumber.from(instruction.approveIX.gasPrice),
+      from: ix.from,
+      to: ix.to,
+      data: ix.data,
+      chainId: ix.chainId,
+      gasPrice: BigNumber.from(ix.gasPrice).toHexString(),
+      value: BigNumber.from(ix.value || 0).toHexString(),
     });
+    
     await tx.wait();
   }
 
+  // 2. Handle Transaction (Swap/Burn)
+  const ix = instruction.transferIX;
+  console.log("   -> Executing Transaction...");
+  
   const tx = await signer.sendTransaction({
-    to: instruction.transferIX.to,
-    data: instruction.transferIX.data,
-    value: BigNumber.from(instruction.transferIX.value),
-    gasPrice: BigNumber.from(instruction.transferIX.gasPrice),
+    from: ix.from,
+    to: ix.to,
+    data: ix.data,
+    chainId: ix.chainId,
+    gasPrice: BigNumber.from(ix.gasPrice).toHexString(),
+    value: BigNumber.from(ix.value || 0).toHexString(),
   });
 
   const receipt = await tx.wait();
   return receipt.transactionHash;
 }
 
-/* ----------------------- EXECUTE APTOS TX --------------------------------- */
-function formatFunctionName(
-  fn: string
-): `${string}::${string}::${string}` {
+function formatFunctionName(fn: string): `${string}::${string}::${string}` {
   return fn as `${string}::${string}::${string}`;
 }
 
 async function executeAptosInstruction(
   aptos: Aptos,
   signer: Ed25519Account,
-  payload: {
-    function: string;
-    type_arguments: string[];
-    arguments: any[];
-  }
+  payload: any
 ): Promise<string> {
+  
   const tx = await aptos.transaction.build.simple({
     sender: signer.accountAddress.toString(),
     data: {
       function: formatFunctionName(payload.function),
       typeArguments: payload.type_arguments,
       functionArguments: payload.arguments,
-    },
-    options: {
-      gasUnitPrice: 100,
-      maxGasAmount: 4000,
     },
   });
 
@@ -211,23 +238,14 @@ async function executeAptosInstruction(
   return res.hash;
 }
 
-/* -------------------- RATE-LIMIT SAFE CLAIM CALL --------------------------- */
 async function callClaimWithRetry(body: any) {
   while (true) {
     try {
-      return await axios.post(
-        `${KANA_API_URL}/v1/claim`,
-        body,
-        { headers }
-      );
+      return await axios.post(`${KANA_API_URL}/v1/claim`, body, { headers });
     } catch (err: any) {
       if (err?.response?.status === 429) {
-        const retryAfter = Number(
-          err.response.headers["retry-after"] ?? 10
-        );
-        console.log(
-          `⏳ Claim rate-limited. Retrying in ${retryAfter}s...`
-        );
+        const retryAfter = Number(err.response.headers["retry-after"] ?? 5);
+        console.log(`⏳ Rate limited. Retrying in ${retryAfter}s...`);
         await new Promise((r) => setTimeout(r, retryAfter * 1000));
         continue;
       }
@@ -236,44 +254,37 @@ async function callClaimWithRetry(body: any) {
   }
 }
 
-/* -------------------- CCTP ATTESTATION POLLING ----------------------------- */
-
 const CIRCLE_ATTESTATION_API = "https://iris-api.circle.com";
-
 const CHAIN_TO_CCTP_ID: Record<number, number> = {
   [NetworkId.ethereum]: 0,
   [NetworkId.Avalanche]: 1,
   [NetworkId.Arbitrum]: 3,
   [NetworkId.solana]: 5,
   [NetworkId.base]: 6,
-  [NetworkId.polygon]: 7,
+  [NetworkId.polygon]: 7, 
   [NetworkId.aptos]: 9,
 };
 
-async function waitForAttestation(params: {
-  sourceChain: NetworkId;
-  txHash: string;
-}) {
+async function waitForAttestation(params: { sourceChain: NetworkId; txHash: string }) {
   const { sourceChain, txHash } = params;
-
   const pollIntervalMs = 5000;
-  const maxRetries = 400;
 
-  for (let i = 0; i < maxRetries; i++) {
-    const url = `${CIRCLE_ATTESTATION_API}/messages/${CHAIN_TO_CCTP_ID[sourceChain]}/${txHash}`;
-    const res = await fetch(url);
-    const json = await res.json();
+  while(true) {
+    try {
+        const url = `${CIRCLE_ATTESTATION_API}/messages/${CHAIN_TO_CCTP_ID[sourceChain]}/${txHash}`;
+        const res = await fetch(url);
+        const json = await res.json();
 
-    const msg = json?.messages?.[0];
-    if (msg && msg.attestation !== "PENDING") {
-      return {
-        messageBytes: msg.message,
-        attestationSignature: msg.attestation,
-      };
-    }
-
+        const msg = json?.messages?.[0];
+        if (msg && msg.attestation !== "PENDING") {
+        return {
+            messageBytes: msg.message,
+            attestationSignature: msg.attestation,
+        };
+        }
+    } catch(e) {}
+    
+    process.stdout.write(".");
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
-
-  throw new Error("CCTP attestation timeout");
 }
