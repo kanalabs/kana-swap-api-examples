@@ -11,6 +11,7 @@
     "example:evm-recipient-swap": "tsx src/same-chain/evm/recipientSwap.ts",
     "example:solana-swap": "tsx src/same-chain/solana/swap.ts",
     "example:solana-recipient-swap": "tsx src/same-chain/solana/recipientSwap.ts",
+    "example:ton-swap": "tsx src/same-chain/ton/swap.ts",
     "example:evm-swap-viem": "tsx src/same-chain/evm/viem/swap.ts",
     "example:evm-recipient-swap-viem": "tsx src/same-chain/evm/viem/recipientSwap.ts"
   },
@@ -20,6 +21,8 @@
     "@solana/kit": "^5.1.0",
     "@solana/spl-token": "^0.4.14",
     "@solana/web3.js": "1.98.4",
+    "@ton/crypto": "3.3.0",
+    "@ton/ton": "15.4.0",
     "axios": "1.8.4",
     "bs58": "6.0.0",
     "dotenv": "16.4.7",

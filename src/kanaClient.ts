@@ -5,6 +5,6 @@ export const kanaClient = axios.create({
   timeout: 15_000,
   headers: {
     "Content-Type": "application/json",
-    "X-API-KEY": process.env.KANA_API_KEY!,
+    "X-API-KEY": process.env.XYRA_API_KEY!,
   },
 });
