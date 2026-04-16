@@ -10,5 +10,6 @@ export enum NetworkId {
     'zkSync' = 9,
     'Avalanche' = 10,
     'Arbitrum' = 11,
+    'ton' = 14,
 }
 export const KANA_DIAMOND_ADDRESS = "0xA1BB807fF6701f4e1b404Eb35Da55d8E9f3fb25c";
