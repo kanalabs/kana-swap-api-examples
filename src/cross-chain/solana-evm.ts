@@ -1,338 +1,276 @@
 /**
- * Solana (SOL) → Avalanche (AVAX)
- * Flow:
- * 1. Source Swap: SOL → USDC (using sourceSwapRoute from Quote)
- * 2. Bridge: USDC → USDC (via CCTP)
- * 3. Claim: Mint USDC on Avalanche
- * 4. Target Swap: USDC → AVAX (using targetSwapRoute logic)
+ * Solana (SOL) → Polygon (POL)
  */
 
 import axios from "axios";
 import "dotenv/config";
-
-import {
-  Connection,
-  Keypair,
-  VersionedTransaction,
-  clusterApiUrl,
-  PublicKey,
+import { 
+    Connection, 
+    Keypair, 
+    VersionedTransaction, 
+    clusterApiUrl 
 } from "@solana/web3.js";
-
-import { ethers } from "ethers";
-import { BigNumber } from "@ethersproject/bignumber";
+import { ethers, BigNumber } from "ethers";
 import bs58 from "bs58";
-
 import { KANA_API_URL, NetworkId } from "../constant";
 
-/* -------------------------------------------------------------------------- */
-/* CONFIG                                    */
-/* -------------------------------------------------------------------------- */
+/* --------------------------- CONFIG --------------------------------------- */
 
 const SOURCE_TOKEN = "So11111111111111111111111111111111111111112"; // SOL
-const TARGET_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"; // AVAX
-
+const TARGET_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"; // POL
 const AMOUNT_IN = "10000000"; // 0.01 SOL
-const SLIPPAGE = 1.0; 
+const SLIPPAGE = 1.0;
 
-const headers = {
-  "Content-Type": "application/json",
-  "X-API-KEY": process.env.XYRA_API_KEY!,
-};
+const headers = { "Content-Type": "application/json", "X-API-KEY": process.env.XYRA_API_KEY! };
 
 /* --------------------------- SETUP ---------------------------------------- */
 
-// Solana
-const solanaConnection = new Connection(
-  process.env.SOLANA_RPC_URL || clusterApiUrl("mainnet-beta"),
-  "confirmed"
-);
-const solanaSigner = Keypair.fromSecretKey(
-  bs58.decode(process.env.SOLANA_PRIVATE_KEY!)
-);
+const solanaConnection = new Connection(process.env.SOLANA_RPC_URL || clusterApiUrl("mainnet-beta"), "confirmed");
+const solanaSigner = Keypair.fromSecretKey(bs58.decode(process.env.SOLANA_PRIVATE_KEY!));
 
-// Avalanche
-const avaxProvider = new ethers.providers.JsonRpcProvider(
-  process.env.AVALANCHE_RPC_URL!
-);
-const avaxSigner = new ethers.Wallet(
-  process.env.EVM_PRIVATE_KEY!,
-  avaxProvider
-);
+const polygonProvider = new ethers.providers.JsonRpcProvider(process.env.POLYGON_RPC_URL!);
+const polygonSigner = new ethers.Wallet(process.env.EVM_PRIVATE_KEY!, polygonProvider);
 
 /* -------------------------------------------------------------------------- */
-/* MAIN FLOW                                   */
+/* MAIN FLOW                                                                  */
 /* -------------------------------------------------------------------------- */
 
-async function solanaToAvalancheFlow() {
-  console.log("🚀 Starting Flow: SOL (Solana) -> AVAX (Avalanche)");
+async function solanaToPolygonFlow() {
+  console.log("🚀 Robust Flow: SOL (Solana) -> POL (Polygon)");
+  console.log(`👤 User: ${solanaSigner.publicKey.toBase58()}`);
 
-  /* -------------------- 1. FETCH CROSS-CHAIN QUOTE ----------------------- */
+  // 1. QUOTE
   const quoteRes = await axios.get(`${KANA_API_URL}/v1/crossChainQuote`, {
     params: {
-      sourceToken: SOURCE_TOKEN,
-      targetToken: TARGET_TOKEN,
-      sourceChain: NetworkId.solana,
-      targetChain: NetworkId.Avalanche,
-      amountIn: AMOUNT_IN,
-      sourceSlippage: SLIPPAGE,
-      targetSlippage: SLIPPAGE,
-    },
-    headers,
+      sourceToken: SOURCE_TOKEN, targetToken: TARGET_TOKEN,
+      sourceChain: NetworkId.solana, targetChain: NetworkId.polygon,
+      amountIn: AMOUNT_IN, sourceSlippage: SLIPPAGE, targetSlippage: SLIPPAGE,
+    }, headers,
   });
-
   const quote = quoteRes.data.data[0];
   console.log("✅ Quote fetched");
 
-  /* -------------------- 2. SOURCE SWAP (SOL -> USDC) --------------------- */
-  let bridgedAmount = quote.inAmount; // Default if no swap needed
-
+  /* -------------------------------------------------------------------------- */
+  /* 2. SOURCE SWAP (SOL -> USDC)                                               */
+  /* -------------------------------------------------------------------------- */
+  // The crossChainTransfer endpoint for Solana DOES NOT include the swap.
+  // We must execute it manually using the route from the quote.
+  
   if (quote.sourceSwapRoute) {
-    console.log("🔄 Executing Source Swap (SOL -> USDC)...");
+    console.log("🔄 Step 1: Executing Source Swap (SOL -> USDC)...");
     
-    // We use the route details directly from the cross-chain quote
     const swapTxRes = await axios.post(
       `${KANA_API_URL}/v1/swapInstruction`,
       {
-        quote: quote.sourceSwapRoute,
+        quote: quote.sourceSwapRoute, // Use the route from crossChainQuote
         address: solanaSigner.publicKey.toBase58(),
       },
       { headers }
     );
-    const swapSig = await executeSolanaTx(
-      solanaConnection,
-      solanaSigner,
-      swapTxRes.data.data.swapTransaction
-    );
-    
-    console.log("✅ Source Swap Complete! Tx:", swapSig);
-    
-    // Update amount for the bridge step
-    bridgedAmount = quote.sourceSwapRoute.amountOutWithSlippage;
+
+    const swapTxBase64 = swapTxRes.data.data.swapTransaction;
+    const tx = VersionedTransaction.deserialize(Buffer.from(swapTxBase64, "base64"));
+    tx.sign([solanaSigner]);
+
+    const swapSig = await sendSolanaTransaction(solanaConnection, tx);
+    console.log("✅ Swap Confirmed:", swapSig);
     
     console.log("⏳ Waiting 5s for balance sync...");
     await new Promise(r => setTimeout(r, 5000));
   }
 
-  /* -------------------- 3. BRIDGE (USDC -> USDC) ------------------------- */
-  console.log("🌉 Initiating Bridge (USDC -> USDC)...");
-
-  const bridgeQuoteRes = await axios.get(`${KANA_API_URL}/v1/crossChainQuote`, {
-    params: {
-      sourceToken: quote.sourceBridgeToken, // USDC (EPj...)
-      targetToken: quote.targetBridgeToken, // USDC (0xB97...)
-      sourceChain: NetworkId.solana,
-      targetChain: NetworkId.Avalanche,
-      amountIn: bridgedAmount, 
-      sourceSlippage: SLIPPAGE,
-      targetSlippage: SLIPPAGE,
-    },
-    headers,
-  });
-  
-  const bridgeQuote = bridgeQuoteRes.data.data[0];
+  /* -------------------------------------------------------------------------- */
+  /* 3. BRIDGE (USDC -> Burn)                                                   */
+  /* -------------------------------------------------------------------------- */
+  console.log("🌉 Step 2: Initiating Bridge (USDC -> CCTP Burn)...");
 
   const transferRes = await axios.post(
     `${KANA_API_URL}/v1/crossChainTransfer`,
     {
-      quote: bridgeQuote,
+      quote,
       sourceAddress: solanaSigner.publicKey.toBase58(),
-      targetAddress: await avaxSigner.getAddress(),
-    },
-    { headers }
+      targetAddress: polygonSigner.address,
+    }, { headers }
   );
 
-  const burnTxHash = await executeSolanaTx(
+  const instruction = transferRes.data.data;
+  console.log("✅ Source instructions built");
+
+  // Execute Bridge Instruction
+  const burnTxHash = await executeSolanaInstructions(
     solanaConnection,
     solanaSigner,
-    transferRes.data.data.transferTx
+    instruction
   );
-  console.log("🔥 Burn FINALIZED on Solana:", burnTxHash);
+  console.log("🔥 Burn executed:", burnTxHash);
 
-  /* -------------------- 4. WAIT FOR ATTESTATION -------------------------- */
-  console.log("⏳ Polling for CCTP Attestation...");
-  const { messageBytes, attestationSignature } =
-    await waitForCctpAttestation(burnTxHash);
+  // 4. ATTESTATION
+  console.log("⏳ Polling for Attestation...");
+  const { messageBytes, attestationSignature } = await waitForCctpAttestation(burnTxHash);
+  console.log("🟢 Attestation ready");
 
-  console.log("🟢 CCTP Attestation Ready!");
-
-  /* -------------------- 5. CLAIM (MINT USDC) ----------------------------- */
-  console.log("📥 Claiming USDC on Avalanche...");
-  
+  // 5. CLAIM
   const claimRes = await axios.post(
     `${KANA_API_URL}/v1/claim`,
-    {
-      quote: bridgeQuote,
-      targetAddress: await avaxSigner.getAddress(),
-      messageBytes,
-      attestationSignature,
-    },
+    { quote, targetAddress: polygonSigner.address, messageBytes, attestationSignature },
     { headers }
   );
-
   const claimIx = claimRes.data.data.claimIx;
-  
-  const mintTx = await avaxSigner.sendTransaction({
-    to: claimIx.to,
-    data: claimIx.data,
-    value: BigNumber.from(claimIx.value || 0),
+  const mintTx = await polygonSigner.sendTransaction({
+    from: claimIx.from,
+    to: claimIx.to, 
+    data: claimIx.data, 
+    chainId: claimIx.chainId,
+    gasPrice: BigNumber.from(claimIx.gasPrice).toHexString(),
+    value: BigNumber.from(claimIx.value).toHexString()
   });
+  await mintTx.wait();
+  console.log("🎉 USDC Minted on Polygon");
 
-  const mintReceipt = await mintTx.wait();
-  console.log("🎉 USDC Minted on Avalanche:", mintReceipt.transactionHash);
-
-  console.log("⏳ Waiting 3s for EVM sync...");
-  await new Promise(r => setTimeout(r, 3000));
-
-  /* -------------------- 6. TARGET SWAP (USDC -> AVAX) -------------------- */
+  // 6. TARGET SWAP
   if (quote.targetSwapRoute) {
-    console.log("🔄 Executing Target Swap (USDC -> AVAX)...");
-    
-    const avaxSwapQuoteRes = await axios.get(`${KANA_API_URL}/v1/swapQuote`, {
-      params: {
-        inputToken: quote.targetSwapRoute.sourceToken, // USDC
-        outputToken: quote.targetSwapRoute.targetToken, // AVAX
-        chain: NetworkId.Avalanche,
-        amountIn: bridgeQuote.outAmount,
-        slippage: SLIPPAGE,
-      },
-      headers,
-    });
-
-    const avaxSwapQuote = avaxSwapQuoteRes.data.data[0];
-
-    const avaxSwapTxRes = await axios.post(
-      `${KANA_API_URL}/v1/swapInstruction`,
+    console.log("🔄 Executing Target Swap...");
+    const swapInstructionRes = await axios.post(
+      `${KANA_API_URL}/v1/swapInstruction`, 
       {
-        quote: avaxSwapQuote,
-        address: await avaxSigner.getAddress(),
-      },
+        quote: quote.targetSwapRoute, 
+        address: polygonSigner.address,
+      }, 
       { headers }
     );
-
-    const swapInstruction = avaxSwapTxRes.data.data;
-
-    const swapHash = await executeTargetEVMInstruction(avaxSigner, swapInstruction);
-    console.log("🚀 FINAL SUCCESS! Swapped to AVAX. Hash:", swapHash);
-  } else {
-    console.log("🏁 No target swap required.");
+    await executeTargetEVMInstruction(polygonSigner, swapInstructionRes.data.data);
+    console.log("🚀 Final swap complete");
   }
 }
 
-solanaToAvalancheFlow().catch(console.error);
+solanaToPolygonFlow().catch(console.error);
 
 /* -------------------------------------------------------------------------- */
 /* HELPERS                                                                    */
 /* -------------------------------------------------------------------------- */
 
-async function executeSolanaTx(
+async function executeSolanaInstructions(
   connection: Connection,
   signer: Keypair,
-  base64Tx: string
+  instruction: any
 ): Promise<string> {
-  const tx = VersionedTransaction.deserialize(Buffer.from(base64Tx, "base64"));
-  tx.sign([signer]);
+  let lastTx = "";
 
-  const sig = await connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight: false,
-    preflightCommitment: "confirmed",
-  });
-  console.log("⏳ Sent Solana Tx:", sig);
+  // Note: Since we handled Source Swap manually above, this usually won't fire 
+  // for Solana source chains, but kept for compatibility.
+  if (instruction.swapTransaction) {
+    console.log("   -> Executing Swap (from instructions)...");
+    const tx = VersionedTransaction.deserialize(Buffer.from(instruction.swapTransaction, "base64"));
+    tx.sign([signer]);
+    const sig = await sendSolanaTransaction(connection, tx);
+    console.log("   -> Swap Confirmed:", sig);
+    await new Promise(r => setTimeout(r, 2000));
+  }
 
-  const latest = await connection.getLatestBlockhash("confirmed");
-  const status = await connection.confirmTransaction(
-    { signature: sig, ...latest },
-    "finalized"
-  );
+  // Execute Bridge (Transfer)
+  if (instruction.transferTx) {
+    console.log("   -> Executing Bridge Burn...");
+    const tx = VersionedTransaction.deserialize(Buffer.from(instruction.transferTx, "base64"));
+    tx.sign([signer]);
+    
+    const sig = await sendSolanaTransaction(connection, tx);
+    lastTx = sig;
+  }
 
-  if (status.value.err) throw new Error("Transaction failed");
-  return sig;
+  return lastTx;
 }
 
-async function forceApprove(
-    signer: ethers.Wallet, 
-    tokenAddress: string, 
-    spender: string, 
-    amount: any
-) {
-    console.log(`🛡️  Checking Approval for ${tokenAddress}...`);
-    const abi = ["function approve(address spender, uint256 amount) public returns (bool)"];
-    const tokenContract = new ethers.Contract(tokenAddress, abi, signer);
+export const sendSolanaTransaction = async (
+  provider: Connection,
+  transaction: VersionedTransaction
+): Promise<string> => {
+  const serializedTx = transaction.serialize();
+  
+  const RETRY_INTERVAL_MS = 3000;
+  const MAX_ATTEMPTS = 5;
+  const STATUS_CHECK_TIMEOUT_MS = 5000;
+  
+  const blockhash = transaction.message.recentBlockhash as string;
+  let lastError: Error | null = null;
+  let attempt = 0;
+  let signature: string | null = null;
+
+  while (attempt < MAX_ATTEMPTS) {
+    attempt++;
     try {
-        const tx = await tokenContract.approve(spender, amount);
-        console.log("⏳ Sending Approval...");
-        await tx.wait();
-        console.log("✅ Approved:", tx.hash);
-    } catch (e: any) {
-        console.log("⚠️ Approval check skipped/failed:", e.message);
+      // 1. Check if previously sent signature is now confirmed
+      if (signature) {
+        const status = await provider.getSignatureStatus(signature, { searchTransactionHistory: true });
+        if (status?.value?.confirmationStatus === "confirmed" || status?.value?.confirmationStatus === "finalized") {
+          return signature;
+        }
+      }
+
+      // 2. Send Transaction (Retry strategy)
+      if (!signature || (attempt > 1)) {
+        if (attempt > 1) await new Promise((r) => setTimeout(r, RETRY_INTERVAL_MS));
+        
+        signature = await provider.sendRawTransaction(serializedTx, {
+          maxRetries: 0, 
+          preflightCommitment: "confirmed",
+          skipPreflight: true, // Important for retries
+        });
+
+        // 3. Wait for Confirmation
+        try {
+          await Promise.race([
+            provider.confirmTransaction(
+              { signature, blockhash, lastValidBlockHeight: 0 },
+              "confirmed"
+            ),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), STATUS_CHECK_TIMEOUT_MS))
+          ]);
+          return signature;
+        } catch (e) {
+          // Confirmation timed out, loop back and retry
+        }
+      }
+    } catch (error: any) {
+      lastError = error;
+      console.log(`   -> Attempt ${attempt} failed: ${error.message}`);
+      
+      if (error.message.includes("0x1771")) {
+        throw new Error("Slippage: Out Amount less than minimum");
+      }
+      
+      if (error.message.includes("0x1") && attempt > 2) {
+         throw new Error("Insufficient funds (0x1).");
+      }
+      
+      signature = null;
     }
-}
+  }
+
+  throw lastError || new Error(`Failed to send transaction after ${MAX_ATTEMPTS} attempts`);
+};
 
 async function executeTargetEVMInstruction(signer: ethers.Wallet, instruction: any) {
-  
   if (instruction.approveIX) {
-    const txParams = instruction.approveIX;
-    console.log(`🛡️  Approving Token... Spender: ${txParams.to}`);
-
-    const approveTX: ethers.providers.TransactionRequest & { gasLimit?: string } = {
-      from: txParams.from,
-      to: txParams.to,
-      data: txParams.data,
-      chainId: txParams.chainId,
-      gasPrice: txParams.gasPrice ? BigNumber.from(txParams.gasPrice).toHexString() : undefined,
-      value: BigNumber.from(txParams.value || 0).toHexString(),
-    };
-
-    try {
-        const gasLimit = await signer.estimateGas(approveTX);
-        approveTX["gasLimit"] = gasLimit.mul(110).div(100).toHexString();
-    } catch (e) {
-        console.log("⚠️ Gas estimation for approval failed, using fallback.");
-        approveTX["gasLimit"] = ethers.utils.hexlify(150000); 
-    }
-
-    const tx = await signer.sendTransaction(approveTX);
-    console.log("⏳ Sending Approval...");
+    const tx = await signer.sendTransaction({ ...instruction.approveIX, gasLimit: BigNumber.from(150000) });
     await tx.wait();
-    console.log("✅ Approval Confirmed:", tx.hash);
   }
-
   if (instruction.swapIX) {
-    const txParams = instruction.swapIX;
-    console.log("⏳ Sending Swap Tx...");
-
-    const swapTX: ethers.providers.TransactionRequest & { gasLimit?: string } = {
-      from: txParams.from,
-      to: txParams.to,
-      data: txParams.data,
-      chainId: txParams.chainId,
-      gasPrice: txParams.gasPrice ? BigNumber.from(txParams.gasPrice).toHexString() : undefined,
-      value: BigNumber.from(txParams.value || 0).toHexString(),
-    };
-
-    swapTX["gasLimit"] = ethers.utils.hexlify(1000000); 
-    console.log(JSON.stringify(swapTX, null, 2));
-    const tx = await signer.sendTransaction(swapTX);
-    const receipt = await tx.wait();
-    return receipt.transactionHash;
+    const tx = await signer.sendTransaction({ ...instruction.swapIX, gasLimit: BigNumber.from(1000000) });
+    await tx.wait();
   }
-  
-  throw new Error("No swap instructions found in API response");
 }
 
-/* ---------------------- CCTP ATTESTATION POLLING -------------------------- */
 const CIRCLE_ATTESTATION_API = "https://iris-api.circle.com";
-
 async function waitForCctpAttestation(txHash: string) {
-  const cctpChainId = 5; // Solana
   while (true) {
     try {
-        const res = await fetch(`${CIRCLE_ATTESTATION_API}/messages/${cctpChainId}/${txHash}`);
+        const res = await fetch(`${CIRCLE_ATTESTATION_API}/messages/5/${txHash}`);
         const json = await res.json();
-        const msg = json?.messages?.[0];
-        if (msg && msg.attestation !== "PENDING") {
-            return { messageBytes: msg.message, attestationSignature: msg.attestation };
+        if (json?.messages?.[0]?.attestation !== "PENDING") {
+            return { messageBytes: json.messages[0].message, attestationSignature: json.messages[0].attestation };
         }
     } catch(e) {}
+    process.stdout.write(".");
     await new Promise((r) => setTimeout(r, 5000));
   }
 }

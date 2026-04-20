@@ -1,111 +1,115 @@
 /**
- * Redeem flow: EVM → Aptos
+ * Redeem flow: EVM (Polygon/Avax/Eth) → Aptos
  */
+
 import axios from "axios";
 import "dotenv/config";
-import { Aptos, AptosConfig, Network, Ed25519Account, Ed25519PrivateKey, PrivateKey, PrivateKeyVariants } from "@aptos-labs/ts-sdk";
+import {
+  Aptos,
+  AptosConfig,
+  Ed25519Account,
+  Ed25519PrivateKey,
+  Network,
+  PrivateKey,
+  PrivateKeyVariants,
+} from "@aptos-labs/ts-sdk";
 
-const KANA_API_URL = "https://ag.kanalabs.io";
-
-const CIRCLE_ATTESTATION_API = "https://iris-api.circle.com";
-const BRIDGE_ID_CCTP = 3;
-
-// Kana NetworkId Enum
-enum NetworkId {
-  solana = 1,
-  aptos = 2,
-  polygon = 3,
-  bsc = 4,
-  sui = 5,
-  ethereum = 6,
-  base = 7,
-  zkSync = 9,
-  Avalanche = 10,
-  Arbitrum = 11,
-}
-
-// CCTP Domain Map
-const CCTP_CHAIN_MAP: Record<number, number> = {
-  [NetworkId.ethereum]: 0,
-  [NetworkId.Avalanche]: 1,
-  [NetworkId.solana]: 5,
-  [NetworkId.aptos]: 9,
-};
-
-const headers = { "Content-Type": "application/json", "X-API-KEY": process.env.XYRA_API_KEY! };
+import { KANA_API_URL, NetworkId } from "../../constant";
 
 /* -------------------------------------------------------------------------- */
 /* CONFIG                                                                     */
 /* -------------------------------------------------------------------------- */
-const EVM_BURN_TX_HASH = process.env.EVM_BURN_TX_HASH!; 
-if (!EVM_BURN_TX_HASH) throw new Error("Missing EVM_BURN_TX_HASH");
 
-// Aptos Setup
-const aptosConfig = new AptosConfig({ network: Network.MAINNET });
-const aptos = new Aptos(aptosConfig);
+const EVM_BURN_TX_HASH = process.env.EVM_BURN_TX_HASH!;
+
+const SOURCE_CHAIN_ID = NetworkId.polygon; 
+
+if (!EVM_BURN_TX_HASH) {
+    throw new Error("❌ Missing EVM_BURN_TX_HASH in .env or config");
+}
+
+const BRIDGE_ID_CCTP = 3; 
+
+const headers = {
+  "Content-Type": "application/json",
+  "X-API-KEY": process.env.XYRA_API_KEY!,
+};
+
+/* ----------------------------- APTOS SETUP -------------------------------- */
+
+const aptos = new Aptos(new AptosConfig({ network: Network.MAINNET }));
+
 const aptosAccount = new Ed25519Account({
-  privateKey: new Ed25519PrivateKey(PrivateKey.formatPrivateKey(process.env.APTOS_PRIVATE_KEY!, PrivateKeyVariants.Ed25519)),
+  privateKey: new Ed25519PrivateKey(
+    PrivateKey.formatPrivateKey(
+      process.env.APTOS_PRIVATE_KEY!,
+      PrivateKeyVariants.Ed25519
+    )
+  ),
 });
 
 /* -------------------------------------------------------------------------- */
 /* MAIN FLOW                                                                  */
 /* -------------------------------------------------------------------------- */
+
 async function redeemEvmToAptos() {
   console.log("🚀 Starting Redeem: EVM -> Aptos");
+  console.log(`🔹 Source Chain: ${NetworkId[SOURCE_CHAIN_ID]}`);
   console.log("🔹 Burn Hash:", EVM_BURN_TX_HASH);
+  console.log(`👤 Target Aptos User: ${aptosAccount.accountAddress.toString()}`);
 
-  // 1. Wait for Attestation
+  /* -------------------- 1. WAIT FOR ATTESTATION --------------------------- */
   console.log("⏳ Polling for CCTP Attestation...");
+  
   const { messageBytes, attestationSignature } = await waitForAttestation(
-    NetworkId.ethereum, // Or whichever EVM chain you burned on
+    SOURCE_CHAIN_ID, 
     EVM_BURN_TX_HASH
   );
-  console.log("🟢 CCTP attestation ready!");
+  console.log("🟢 CCTP Attestation Ready!");
 
-  // 2. Build Redeem
+  /* -------------------- 2. BUILD REDEEM PAYLOAD --------------------------- */
+  console.log("🛠️ Fetching redeem instruction from API...");
+  
   try {
+    // Note: Wrapping bytes/signature in Array [] to match backend requirement
     const res = await axios.post(`${KANA_API_URL}/v1/redeem`, {
-      sourceChainID: NetworkId.ethereum, // Match source
-      targetChainID: NetworkId.aptos,
+      sourceChainID: SOURCE_CHAIN_ID,
+      targetChainID: NetworkId.aptos, 
       bridgeID: BRIDGE_ID_CCTP,
       targetAddress: aptosAccount.accountAddress.toString(),
-      messageBytes,
-      attestationSignature,
+      messageBytes: [messageBytes], 
+      attestationSignature: [attestationSignature], 
     }, { headers });
 
-    const responseData = res.data;
-    const dataBlock = responseData.data?.[0] || responseData.data || responseData;
-
-    if (!dataBlock) throw new Error("API returned empty data.");
-
-    const payload = dataBlock.claimPayload || dataBlock.claimIx || dataBlock.redeemIx || dataBlock.payload || dataBlock.transaction;
+    const redeemData = res.data.data;
     
-    if (!payload) {
-        throw new Error(`Missing Aptos payload. Available keys: ${Object.keys(dataBlock).join(", ")}`);
+    const aptosPayload = redeemData.claimPayload || redeemData.claimIx || redeemData;
+
+    if (!aptosPayload || !aptosPayload.function) {
+        console.error("❌ Invalid response:", redeemData);
+        throw new Error("API did not return a valid Aptos Move payload.");
     }
 
-    console.log("✅ Redeem instruction received");
+    console.log("✅ Redeem instruction built");
 
-    // 3. Execute on Aptos
-    console.log("📤 Submitting to Aptos...");
-    const transaction = await aptos.transaction.build.simple({
-      sender: aptosAccount.accountAddress,
-      data: {
-        function: payload.function,
-        typeArguments: payload.type_arguments,
-        functionArguments: payload.arguments,
-      },
-    });
+    /* -------------------- 3. EXECUTE ON APTOS ----------------------------- */
+    console.log("📤 Submitting Redeem Transaction to Aptos...");
 
-    const pendingTx = await aptos.signAndSubmitTransaction({ signer: aptosAccount, transaction });
-    console.log("⏳ Transaction sent:", pendingTx.hash);
+    const mintTxHash = await executeAptosInstruction(
+        aptos,
+        aptosAccount,
+        aptosPayload
+    );
 
-    await aptos.waitForTransaction({ transactionHash: pendingTx.hash });
-    console.log("🎉 Success! Redeemed on Aptos.");
+    console.log("🎉 Success! Redeem confirmed on Aptos.");
+    console.log("🔗 Tx Hash:", mintTxHash);
 
-  } catch (error: any) {
-    if (error.response) console.error("❌ API Error:", JSON.stringify(error.response.data, null, 2));
-    else console.error("❌ Error:", error.message);
+  } catch (e: any) {
+      if (e.response) {
+          console.error("❌ API Error:", JSON.stringify(e.response.data, null, 2));
+      } else {
+          console.error("❌ Error:", e.message);
+      }
   }
 }
 
@@ -114,21 +118,76 @@ redeemEvmToAptos().catch(console.error);
 /* -------------------------------------------------------------------------- */
 /* HELPERS                                                                    */
 /* -------------------------------------------------------------------------- */
-async function waitForAttestation(chain: number, txHash: string) {
-  const pollInterval = 5000; const maxRetries = 120; let retries = 0;
-  while (retries < maxRetries) {
+
+function formatFunctionName(fn: string): `${string}::${string}::${string}` {
+  return fn as `${string}::${string}::${string}`;
+}
+
+async function executeAptosInstruction(
+  aptos: Aptos,
+  signer: Ed25519Account,
+  payload: any
+): Promise<string> {
+  const tx = await aptos.transaction.build.simple({
+    sender: signer.accountAddress.toString(),
+    data: {
+      function: formatFunctionName(payload.function),
+      typeArguments: payload.type_arguments,
+      functionArguments: payload.arguments,
+    },
+  });
+
+  const res = await aptos.signAndSubmitTransaction({
+    signer,
+    transaction: tx,
+  });
+
+  console.log("   -> Tx Sent. Waiting for confirmation...");
+  await aptos.waitForTransaction({
+    transactionHash: res.hash,
+    options: { checkSuccess: true },
+  });
+
+  return res.hash;
+}
+
+/* ---------------------- CCTP ATTESTATION POLLING -------------------------- */
+
+const CIRCLE_ATTESTATION_API = "https://iris-api.circle.com";
+
+const CHAIN_TO_CCTP_ID: Record<number, number> = {
+  [NetworkId.ethereum]: 0,
+  [NetworkId.Avalanche]: 1,
+  [NetworkId.Arbitrum]: 3,
+  [NetworkId.solana]: 5,
+  [NetworkId.base]: 6,
+  [NetworkId.polygon]: 7,
+  [NetworkId.sui]: 8,
+  [NetworkId.aptos]: 9,
+};
+
+async function waitForAttestation(sourceChain: number, txHash: string) {
+  const pollInterval = 5000; 
+  
+  while (true) {
     try {
-      const url = `${CIRCLE_ATTESTATION_API}/messages/${CCTP_CHAIN_MAP[chain]}/${txHash}`;
+      const url = `${CIRCLE_ATTESTATION_API}/messages/${CHAIN_TO_CCTP_ID[sourceChain]}/${txHash}`;
       const res = await fetch(url);
+      
       if (res.ok) {
         const json = await res.json();
         const msg = json?.messages?.[0];
-        if (msg && msg.attestation !== 'PENDING') return { messageBytes: msg.message, attestationSignature: msg.attestation };
+        
+        if (msg && msg.attestation !== 'PENDING') {
+          return { 
+            messageBytes: msg.message, 
+            attestationSignature: msg.attestation 
+          };
+        }
       }
     } catch (e) {}
-    retries++;
-    if(retries % 6 === 0) console.log(`...waiting (${retries}/${maxRetries})`);
+    
+    process.stdout.write(".");
     await new Promise(r => setTimeout(r, pollInterval));
   }
-  throw new Error("❌ CCTP Attestation Timed Out");
 }

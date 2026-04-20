@@ -199,9 +199,12 @@ async function aptosToPolygonSwap() {
   const claimIx = claimRes.data.data.claimIx;
 
   const mintTx = await signer.sendTransaction({
+    from: claimIx.from,
     to: claimIx.to,
     data: claimIx.data,
-    value: BigNumber.from(claimIx.value || 0),
+    chainId: claimIx.chainId,
+    gasPrice: BigNumber.from(claimIx.gasPrice).toHexString(),
+    value: BigNumber.from(claimIx.value).toHexString()
   });
 
   console.log("⏳ Minting USDC on Polygon...");

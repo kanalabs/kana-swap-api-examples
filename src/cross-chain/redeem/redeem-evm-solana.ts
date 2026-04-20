@@ -1,32 +1,176 @@
 /**
- * Redeem flow: EVM → Solana
+ * Redeem flow: EVM (Polygon/Avax) → Solana
  */
+
 import axios from "axios";
 import "dotenv/config";
-import { Connection, Keypair, VersionedTransaction, clusterApiUrl } from "@solana/web3.js";
+import {
+  Connection,
+  Keypair,
+  VersionedTransaction,
+  clusterApiUrl,
+} from "@solana/web3.js";
 import bs58 from "bs58";
 
-const KANA_API_URL = "https://ag.kanalabs.io";
+import { KANA_API_URL, NetworkId } from "../../constant";
 
-const CIRCLE_ATTESTATION_API = "https://iris-api.circle.com";
-const BRIDGE_ID_CCTP = 3;
+/* -------------------------------------------------------------------------- */
+/* CONFIG                                                                     */
+/* -------------------------------------------------------------------------- */
 
-// Kana NetworkId Enum
-enum NetworkId {
-  solana = 1,
-  aptos = 2,
-  polygon = 3,
-  bsc = 4,
-  sui = 5,
-  ethereum = 6,
-  base = 7,
-  zkSync = 9,
-  Avalanche = 10,
-  Arbitrum = 11,
+const EVM_BURN_TX_HASH = process.env.EVM_BURN_TX_HASH!;
+
+const SOURCE_CHAIN_ID = NetworkId.polygon; 
+
+if (!EVM_BURN_TX_HASH) {
+    throw new Error("❌ Missing EVM_BURN_TX_HASH in .env or config");
 }
 
-// Full CCTP Domain Map for robustness
-const CCTP_CHAIN_MAP: Record<number, number> = {
+const BRIDGE_ID_CCTP = 3; 
+
+const headers = {
+  "Content-Type": "application/json",
+  "X-API-KEY": process.env.XYRA_API_KEY!,
+};
+
+/* ---------------------------- SOLANA SETUP -------------------------------- */
+
+const solanaConnection = new Connection(
+  process.env.SOLANA_RPC_URL || clusterApiUrl("mainnet-beta"),
+  "confirmed"
+);
+
+const solanaSigner = Keypair.fromSecretKey(
+  bs58.decode(process.env.SOLANA_PRIVATE_KEY!)
+);
+
+/* -------------------------------------------------------------------------- */
+/* MAIN FLOW                                                                  */
+/* -------------------------------------------------------------------------- */
+
+async function redeemEvmToSolana() {
+  console.log("🚀 Starting Redeem: EVM -> Solana");
+  console.log(`🔹 Source Chain: ${NetworkId[SOURCE_CHAIN_ID]}`);
+  console.log("🔹 Burn Hash:", EVM_BURN_TX_HASH);
+  console.log(`👤 Target Solana User: ${solanaSigner.publicKey.toBase58()}`);
+
+  /* -------------------- 1. WAIT FOR ATTESTATION --------------------------- */
+  console.log("⏳ Polling for CCTP Attestation...");
+  
+  const { messageBytes, attestationSignature } = await waitForAttestation(
+    SOURCE_CHAIN_ID, 
+    EVM_BURN_TX_HASH
+  );
+  console.log("🟢 CCTP Attestation Ready!");
+
+  /* -------------------- 2. BUILD REDEEM TRANSACTION ----------------------- */
+  console.log("🛠️ Fetching redeem instruction from API...");
+  
+  try {
+    // Note: Wrapping bytes/signature in Array [] to match backend requirement
+    const res = await axios.post(`${KANA_API_URL}/v1/redeem`, {
+      sourceChainID: SOURCE_CHAIN_ID,
+      targetChainID: NetworkId.solana, 
+      bridgeID: BRIDGE_ID_CCTP,
+      targetAddress: solanaSigner.publicKey.toBase58(),
+      messageBytes: [messageBytes], 
+      attestationSignature: [attestationSignature], 
+    }, { headers });
+
+    const redeemData = res.data.data;
+    
+    const solanaTxBase64 = redeemData.claimIx || redeemData.transaction || redeemData;
+
+    if (!solanaTxBase64 || typeof solanaTxBase64 !== 'string') {
+        console.error("❌ Invalid response:", redeemData);
+        throw new Error("API did not return a valid Solana transaction string.");
+    }
+
+    console.log("✅ Redeem instruction built");
+
+    /* -------------------- 3. EXECUTE ON SOLANA ---------------------------- */
+    console.log("📤 Submitting Redeem Transaction to Solana...");
+
+    const tx = VersionedTransaction.deserialize(Buffer.from(solanaTxBase64, "base64"));
+    tx.sign([solanaSigner]);
+
+    const mintTxHash = await sendSolanaTransaction(solanaConnection, tx);
+
+    console.log("🎉 Success! Redeem confirmed on Solana.");
+    console.log("🔗 Tx Hash:", mintTxHash);
+
+  } catch (e: any) {
+      if (e.response) {
+          console.error("❌ API Error:", JSON.stringify(e.response.data, null, 2));
+      } else {
+          console.error("❌ Error:", e.message);
+      }
+  }
+}
+
+redeemEvmToSolana().catch(console.error);
+
+/* -------------------------------------------------------------------------- */
+/* HELPERS                                                                    */
+/* -------------------------------------------------------------------------- */
+
+export const sendSolanaTransaction = async (
+  provider: Connection,
+  transaction: VersionedTransaction
+): Promise<string> => {
+  const serializedTx = transaction.serialize();
+  const blockhash = transaction.message.recentBlockhash as string;
+  let attempt = 0;
+  let signature: string | null = null;
+
+  while (attempt < 5) {
+    attempt++;
+    try {
+      if (signature) {
+        const status = await provider.getSignatureStatus(signature, { searchTransactionHistory: true });
+        if (status?.value?.confirmationStatus === "confirmed" || status?.value?.confirmationStatus === "finalized") {
+          return signature;
+        }
+      }
+
+      if (!signature || (attempt > 1)) {
+        if (attempt > 1) await new Promise((r) => setTimeout(r, 2000));
+        
+        signature = await provider.sendRawTransaction(serializedTx, {
+          maxRetries: 0, 
+          preflightCommitment: "confirmed",
+          skipPreflight: true, 
+        });
+
+        try {
+          await Promise.race([
+            provider.confirmTransaction(
+              { signature, blockhash, lastValidBlockHeight: 0 },
+              "confirmed"
+            ),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 5000))
+          ]);
+          return signature;
+        } catch (e) { }
+      }
+    } catch (error: any) {
+      console.log(`   -> Attempt ${attempt} failed: ${error.message}`);
+      if (error.message.includes("0x1")) { 
+          // If 0x1 (insufficient funds) happens, it might mean the claim was already processed or fee payer has no SOL
+          throw new Error("Transaction failed (0x1). Check if already redeemed or insufficient SOL for gas.");
+      }
+      signature = null;
+    }
+  }
+
+  throw new Error(`Failed to send transaction after ${5} attempts`);
+};
+
+/* ---------------------- CCTP ATTESTATION POLLING -------------------------- */
+
+const CIRCLE_ATTESTATION_API = "https://iris-api.circle.com";
+
+const CHAIN_TO_CCTP_ID: Record<number, number> = {
   [NetworkId.ethereum]: 0,
   [NetworkId.Avalanche]: 1,
   [NetworkId.Arbitrum]: 3,
@@ -37,106 +181,28 @@ const CCTP_CHAIN_MAP: Record<number, number> = {
   [NetworkId.aptos]: 9,
 };
 
-/* -------------------------------------------------------------------------- */
-/* CONFIG                                                                     */
-/* -------------------------------------------------------------------------- */
-const EVM_BURN_TX_HASH = process.env.EVM_BURN_TX_HASH!;
-if (!EVM_BURN_TX_HASH) throw new Error("Missing EVM_BURN_TX_HASH");
-
-// Setup Solana
-const connection = new Connection(process.env.SOLANA_RPC_URL || clusterApiUrl("mainnet-beta"), "confirmed");
-const signer = Keypair.fromSecretKey(bs58.decode(process.env.SOLANA_PRIVATE_KEY!));
-
-const headers = { "Content-Type": "application/json", "X-API-KEY": process.env.XYRA_API_KEY! };
-
-/* -------------------------------------------------------------------------- */
-/* MAIN FLOW                                                                  */
-/* -------------------------------------------------------------------------- */
-async function redeemEvmToSolana() {
-  console.log("🚀 Starting Redeem: EVM -> Solana");
-  console.log("🔹 Burn Hash:", EVM_BURN_TX_HASH);
+async function waitForAttestation(sourceChain: number, txHash: string) {
+  const pollInterval = 5000; 
   
-  // 1. Wait for Attestation
-  console.log("⏳ Polling for CCTP Attestation...");
-  const { messageBytes, attestationSignature } = await waitForAttestation(
-    NetworkId.ethereum, // Or source chain ID
-    EVM_BURN_TX_HASH
-  );
-  console.log("🟢 CCTP attestation ready!");
-
-  // 2. Build Redeem
-  console.log("🛠️ Building redeem transaction via API...");
-  try {
-    const res = await axios.post(`${KANA_API_URL}/v1/redeem`, {
-      sourceChainID: NetworkId.ethereum,
-      targetChainID: NetworkId.solana,
-      bridgeID: BRIDGE_ID_CCTP,
-      targetAddress: signer.publicKey.toBase58(),
-      messageBytes,
-      attestationSignature,
-    }, { headers });
-
-    const dataBlock = res.data.data?.[0] || res.data.data;
-    if (!dataBlock) throw new Error("API returned empty data.");
-
-    const txBase64 = dataBlock.redeemIx || dataBlock.transaction || dataBlock.claimIx || dataBlock.payload || dataBlock.claimPayload;
-    
-    if (!txBase64) {
-      throw new Error(`Missing transaction string. Available keys: ${Object.keys(dataBlock).join(", ")}`);
-    }
-
-    console.log("✅ Redeem instruction received");
-
-    // 3. Execute
-    console.log("📤 Submitting to Solana...");
-    const tx = VersionedTransaction.deserialize(Buffer.from(txBase64, "base64"));
-    tx.sign([signer]);
-    
-    const sig = await connection.sendRawTransaction(tx.serialize(), { 
-        skipPreflight: false,
-        maxRetries: 3 
-    });
-    console.log("⏳ Sent:", sig);
-    
-    const latest = await connection.getLatestBlockhash();
-    await connection.confirmTransaction({ 
-        signature: sig, 
-        blockhash: latest.blockhash, 
-        lastValidBlockHeight: latest.lastValidBlockHeight 
-    }, "finalized");
-    
-    console.log("🎉 Success! Redeemed on Solana.");
-    console.log(`🔗 Explorer: https://solscan.io/tx/${sig}`);
-
-  } catch (error: any) {
-    if (error.response) {
-        console.error("❌ API Error:", JSON.stringify(error.response.data, null, 2));
-    } else {
-        console.error("❌ Error:", error.message);
-    }
-  }
-}
-
-redeemEvmToSolana().catch(console.error);
-
-/* -------------------------------------------------------------------------- */
-/* HELPERS                                                                    */
-/* -------------------------------------------------------------------------- */
-async function waitForAttestation(chain: number, txHash: string) {
-    const pollInterval = 5000; const maxRetries = 120; let retries = 0;
-    while (retries < maxRetries) {
-      try {
-        const url = `${CIRCLE_ATTESTATION_API}/messages/${CCTP_CHAIN_MAP[chain]}/${txHash}`;
-        const res = await fetch(url);
-        if (res.ok) {
-          const json = await res.json();
-          const msg = json?.messages?.[0];
-          if (msg && msg.attestation !== 'PENDING') return { messageBytes: msg.message, attestationSignature: msg.attestation };
+  while (true) {
+    try {
+      const url = `${CIRCLE_ATTESTATION_API}/messages/${CHAIN_TO_CCTP_ID[sourceChain]}/${txHash}`;
+      const res = await fetch(url);
+      
+      if (res.ok) {
+        const json = await res.json();
+        const msg = json?.messages?.[0];
+        
+        if (msg && msg.attestation !== 'PENDING') {
+          return { 
+            messageBytes: msg.message, 
+            attestationSignature: msg.attestation 
+          };
         }
-      } catch (e) {}
-      retries++;
-      if (retries % 6 === 0) console.log(`...still waiting (${retries}/${maxRetries})`);
-      await new Promise(r => setTimeout(r, pollInterval));
-    }
-    throw new Error("❌ CCTP Attestation Timed Out");
+      }
+    } catch (e) {}
+    
+    process.stdout.write(".");
+    await new Promise(r => setTimeout(r, pollInterval));
+  }
 }
